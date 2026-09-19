@@ -1,0 +1,151 @@
+services:
+  database:
+    image: postgres:16-alpine
+    container_name: notification_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_NAME:-notification_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d notification_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - notification_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: notification_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - notification_network
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: notification_rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"     # AMQP protocol port
+      - "15672:15672"   # Management Web UI
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    networks:
+      - notification_network
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: notification_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - ENV=${ENV:-development}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE:-60}
+      - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@database:5432/${DB_NAME:-notification_db}
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - TEMPLATE_CACHE_TTL=${TEMPLATE_CACHE_TTL:-3600}
+      - USER_PREFS_CACHE_TTL=${USER_PREFS_CACHE_TTL:-3600}
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=${RABBITMQ_USER:-guest}
+      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
+      - RABBITMQ_QUEUE=email_notifications
+      - RABBITMQ_EXCHANGE=email_notifications_exchange
+      - RABBITMQ_ROUTING_KEY=email.notification.send
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - notification_network
+
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: notification_worker
+    restart: unless-stopped
+    environment:
+      - ENV=${ENV:-development}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@database:5432/${DB_NAME:-notification_db}
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - TEMPLATE_CACHE_TTL=${TEMPLATE_CACHE_TTL:-3600}
+      - USER_PREFS_CACHE_TTL=${USER_PREFS_CACHE_TTL:-3600}
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=${RABBITMQ_USER:-guest}
+      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
+      - RABBITMQ_QUEUE=email_notifications
+      - RABBITMQ_EXCHANGE=email_notifications_exchange
+      - RABBITMQ_ROUTING_KEY=email.notification.send
+      - RABBITMQ_PREFETCH_COUNT=10
+      - HEARTBEAT_FILE=/tmp/worker_heartbeat
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import time, os; exit(0 if os.path.exists('/tmp/worker_heartbeat') and time.time() - os.path.getmtime('/tmp/worker_heartbeat') < 30 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - notification_network
+
+networks:
+  notification_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
